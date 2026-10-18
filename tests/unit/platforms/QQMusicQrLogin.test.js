@@ -1,13 +1,22 @@
 const { responseCookies } = require('../../../platforms/qqmusic/util/login-http')
 
 describe('shared QQ QR login', () => {
-  let qr, http
+  let qr, http, androidLoginCgi, bindAndroidLoginContext, errorLog
   beforeEach(() => {
     jest.resetModules()
+    androidLoginCgi = jest.fn()
+    bindAndroidLoginContext = jest.fn()
+    jest.doMock('../../../platforms/qqmusic/util/android-login', () => ({
+      createAndroidLoginContextFromIdentity: () => ({ androidLoginCgi }), bindAndroidLoginContext
+    }))
     qr = require('../../../platforms/qqmusic/util/qq-login')
     http = jest.spyOn(global, 'fetch').mockRejectedValue(new Error('Unmocked request'))
+    errorLog = jest.spyOn(console, 'error').mockImplementation(() => {})
   })
-  afterEach(() => jest.restoreAllMocks())
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.dontMock('../../../platforms/qqmusic/util/android-login')
+  })
   function start() {
     http.mockResolvedValueOnce(new Response('', { headers: { 'set-cookie': 'pt_login_sig=login-session; Path=/' } }))
       .mockResolvedValueOnce(new Response('image', { headers: { 'set-cookie': 'qrsig=qr-session; Path=/' } }))
@@ -28,7 +37,7 @@ describe('shared QQ QR login', () => {
       .mockResolvedValueOnce(new Response('', { status: 302, headers: {
         location: `https://y.qq.com/callback${kind === 'query' ? '?' : '#'}code=abc%2F123&state=state`,
       } }))
-      .mockResolvedValueOnce(Response.json({ code: 0, req_0: { code: 0, data: { str_musicid: '999', musickey: 'music-key' } } }))
+    androidLoginCgi.mockResolvedValueOnce({ code: 0, data: { str_musicid: '999', musickey: 'music-key' } })
     expect(await qr.pollLogin(started.token)).toMatchObject({ status: 'done', cookie: { uin: '999', qm_keyst: 'music-key' } })
     const [checkUrl, checkOptions] = http.mock.calls[3]
     expect(checkUrl.origin).toBe('https://ssl.ptlogin2.graph.qq.com')
@@ -43,7 +52,8 @@ describe('shared QQ QR login', () => {
     const form = new URLSearchParams(oauth.body)
     expect(form.get('g_tk')).toBe(String(qr.hash33('graph-secret', 5381)))
     expect(form.get('redirect_uri')).toBe('https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/')
-    expect(JSON.parse(http.mock.calls[5][1].body).req_0).toEqual({ module: 'QQConnectLogin.LoginServer', method: 'QQLogin', param: { code: 'abc/123' } })
+    expect(androidLoginCgi).toHaveBeenCalledWith('QQConnectLogin.LoginServer', 'QQLogin', { code: 'abc/123' }, {}, { tmeLoginType: 2 })
+    expect(bindAndroidLoginContext).toHaveBeenCalledWith('999', expect.objectContaining({ androidLoginCgi }))
     expect(await qr.pollLogin(started.token)).toEqual({ status: 'expired' })
   })
   test.each([['66', 'waiting'], ['67', 'confirming'], ['65', 'expired'], ['68', 'expired']])('maps status %s', async (code, status) => {
@@ -75,12 +85,28 @@ describe('shared QQ QR login', () => {
     expect(await qr.pollLogin(token)).toMatchObject({ status: 'error', msg: expect.stringContaining('p_skey') })
     expect(await qr.pollLogin(token)).toEqual({ status: 'expired' })
   })
+  test('logs the Android login stage when credential exchange fails', async () => {
+    const { token } = await start()
+    http.mockResolvedValueOnce(callback())
+      .mockResolvedValueOnce(new Response('', { status: 302, headers: { 'set-cookie': 'p_skey=graph-secret; Path=/' } }))
+      .mockResolvedValueOnce(new Response('', { status: 302, headers: { location: 'https://y.qq.com/callback?code=abc' } }))
+    androidLoginCgi.mockRejectedValueOnce(new TypeError('Workers cipher input must be a Buffer'))
+
+    expect(await qr.pollLogin(token)).toMatchObject({ status: 'error', msg: 'Workers cipher input must be a Buffer' })
+    expect(errorLog).toHaveBeenCalledWith('[qq-login] QR login failed', expect.objectContaining({
+      stage: 'android_login', name: 'TypeError', frames: expect.stringContaining('QQMusicQrLogin.test.js')
+    }))
+  })
   test('network failure does not expose credential-bearing URL', async () => {
     const { token } = await start()
     http.mockRejectedValueOnce(new Error('https://example.com/?secret=private-value'))
     const result = await qr.pollLogin(token)
     expect(result.status).toBe('error')
     expect(result.msg).not.toContain('private-value')
+    expect(errorLog).toHaveBeenCalledWith('[qq-login] QR login failed', expect.objectContaining({
+      stage: 'ptqrlogin', name: 'Error'
+    }))
+    expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private-value')
   })
   test('parses combined and separate Set-Cookie without breaking Expires', () => {
     const combined = 'one=1; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/, p_skey=a=b; Path=/'

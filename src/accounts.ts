@@ -11,6 +11,8 @@ export interface RawMusicAccount {
   stateless?: unknown;
   useLuoxue?: unknown;
   lxSource?: unknown;
+  deviceId?: unknown;
+  deviceState?: unknown;
 }
 
 export interface MusicAccountSession {
@@ -21,6 +23,8 @@ export interface MusicAccountSession {
   stateless: boolean;
   useLuoxue: boolean;
   lxSource: string[];
+  deviceId?: string;
+  deviceState?: string;
   favoriteTrackIds: Set<string>;
   userPlaylistIds: Set<string>;
   favoriteArtistIds: Set<string>;
@@ -29,7 +33,23 @@ export interface MusicAccountSession {
   favoriteAlbumsLoaded: boolean;
 }
 
+const qqAndroid = require('../platforms/qqmusic/util/android-login');
+
+function qqMusicid(cookie: string): string {
+  const value = String(cookie || '').split(';').map(item => item.trim()).find(item => item.startsWith('uin='));
+  return value ? value.slice(4).replace(/^o/, '') : '';
+}
+
+function qqDeviceFields(cookie: string): { deviceId?: string; deviceState?: string } {
+  const musicid = qqMusicid(cookie);
+  const context = musicid && qqAndroid.peekAndroidLoginContext(musicid);
+  if (!context) return {};
+  const deviceState = qqAndroid.encodeIdentity(context);
+  return { deviceId: qqAndroid.deviceIdFromIdentity(deviceState), deviceState };
+}
+
 export interface AccountSessionRegistry {
+  onDeleted?: Set<(session: MusicAccountSession) => void>;
   sessions: MusicAccountSession[];
   byAccessKey: Map<string, MusicAccountSession>;
 }
@@ -258,6 +278,8 @@ export function loadAccountSessions(storeInput: AccountStoreInput = process.cwd(
         stateless,
         useLuoxue: useLuoxue.value,
         lxSource: loadAccountLxSources(account.lxSource, accountName),
+        ...(account.deviceId ? { deviceId: String(account.deviceId) } : {}),
+        ...(account.deviceState ? { deviceState: String(account.deviceState) } : {}),
         favoriteTrackIds: new Set<string>(),
         userPlaylistIds: new Set<string>(),
         favoriteArtistIds: new Set<string>(),
@@ -265,6 +287,10 @@ export function loadAccountSessions(storeInput: AccountStoreInput = process.cwd(
         favoriteArtistsLoaded: false,
         favoriteAlbumsLoaded: false
       });
+      if (platform === 'qq' && account.deviceState && qqAndroid.deviceIdFromIdentity(String(account.deviceState))) {
+        const musicid = qqMusicid(String(account.cookie || ''));
+        if (musicid) qqAndroid.getAndroidLoginContext(musicid, String(account.deviceState));
+      }
       keyCounts.set(apiAccessKey, (keyCounts.get(apiAccessKey) || 0) + 1);
     } catch (error) {
       console.warn(`[accounts] 忽略第 ${index + 1} 个账号：${(error as Error).message}`);
@@ -295,7 +321,8 @@ export function updateAccountCookieByAccessKey(
   platformValue: unknown,
   cookie: string,
   registry: AccountSessionRegistry,
-  storeInput: AccountStoreInput = process.cwd()
+  storeInput: AccountStoreInput = process.cwd(),
+  androidIdentity?: string
 ): UpdateAccountCookieResult {
   const token = String(apiAccessKey || '').trim();
   if (!token) {
@@ -334,10 +361,23 @@ export function updateAccountCookieByAccessKey(
   if (storedPlatform !== session.platform) {
     throw new Error('账号数据库中账号平台与当前会话不一致');
   }
+  const deviceFields = platform === 'qq' && androidIdentity
+    ? { deviceId: qqAndroid.deviceIdFromIdentity(androidIdentity), deviceState: androidIdentity }
+    : platform === 'qq'
+      ? {
+          ...(qqMusicid(normalizedCookie) !== qqMusicid(session.cookie)
+            ? { deviceId: undefined, deviceState: undefined } : {}),
+          ...qqDeviceFields(normalizedCookie)
+        }
+      : {};
+  if (platform === 'qq' && androidIdentity && !deviceFields.deviceId) {
+    throw new Error('QQ 刷新返回的设备状态无效');
+  }
   account.cookie = normalizedCookie;
-  store.update(token, { cookie: normalizedCookie });
+  store.update(token, { cookie: normalizedCookie, ...deviceFields });
 
   session.cookie = normalizedCookie;
+  Object.assign(session, deviceFields);
   registry.byAccessKey.set(token, session);
 
   return { session, filePath: store.location };
@@ -385,7 +425,8 @@ export function createAccountWithCookie(
     api_access_key: token,
     stateless: false,
     useLuoxue: platform !== 'ytmusic',
-    lxSource: []
+    lxSource: [],
+    ...(platform === 'qq' ? qqDeviceFields(normalizedCookie) : {})
   };
   store.insert(account);
 
@@ -397,6 +438,8 @@ export function createAccountWithCookie(
     stateless: false,
     useLuoxue: platform !== 'ytmusic',
     lxSource: [],
+    ...(account.deviceId ? { deviceId: String(account.deviceId) } : {}),
+    ...(account.deviceState ? { deviceState: String(account.deviceState) } : {}),
     favoriteTrackIds: new Set<string>(),
     userPlaylistIds: new Set<string>(),
     favoriteArtistIds: new Set<string>(),
@@ -448,4 +491,26 @@ export function updateAccountConfigByAccessKey(
   session.useLuoxue = input.useLuoxue;
   session.lxSource = lxSource;
   return { session, filePath: store.location };
+}
+
+/** Persist deletion before revoking the live account and all registered account state. */
+export function deleteAccount(apiAccessKey: string, registry: AccountSessionRegistry, store: AccountStore): void {
+  const session = registry.byAccessKey.get(apiAccessKey);
+  if (!session) throw new Error('账号不存在');
+  store.delete(apiAccessKey);
+  registry.byAccessKey.delete(apiAccessKey);
+  const index = registry.sessions.indexOf(session);
+  if (index >= 0) registry.sessions.splice(index, 1);
+  for (const cleanup of registry.onDeleted ?? []) cleanup(session);
+  const musicid = qqMusicid(session.cookie);
+  if (session.platform === 'qq' && !registry.sessions.some(item => item.platform === 'qq' && qqMusicid(item.cookie) === musicid)) {
+    qqAndroid.forgetAndroidLoginContext(musicid);
+  }
+  for (const set of [session.favoriteTrackIds, session.favoriteArtistIds, session.favoriteAlbumIds, session.userPlaylistIds]) {
+    set.clear();
+    // In-flight clients retain these sets; prevent late responses from repopulating them.
+    set.add = () => set;
+  }
+  session.cookie = ''; session.deviceId = undefined; session.deviceState = undefined;
+  session.lxSource = []; session.favoriteArtistsLoaded = false; session.favoriteAlbumsLoaded = false;
 }

@@ -8,13 +8,14 @@ import {
   getLxSourceCacheDirectory,
   getLxSourceCachePath,
   createLxSourceConfigs,
+  getLxQualityCandidates,
   mapLxQualityToTrackUrl,
   mapMusicPlatformToLx,
   parseLxScriptInfo,
-  selectLxQuality,
   sourceLabel
 } from './config';
 import { LxSourceRuntime } from './runtime';
+import { getExactLxQuality } from './quality';
 import type {
   LxLogLevel,
   LxSourceCapabilities,
@@ -131,7 +132,8 @@ export class LxSourceManager implements LxTrackUrlResolver, LxSourceLifecycle {
     platform: MusicPlatform,
     id: string,
     quality?: string,
-    accountSources: readonly string[] = []
+    accountSources: readonly string[] = [],
+    options: { allowFallback?: boolean } = {}
   ): Promise<TrackUrl | undefined> {
     if (this.stopped || this.sources.size === 0) return undefined;
     const lxPlatform = mapMusicPlatformToLx(platform);
@@ -146,25 +148,30 @@ export class LxSourceManager implements LxTrackUrlResolver, LxSourceLifecycle {
       const source = this.sources.get(config.hash);
       const capability = source?.capabilities[lxPlatform];
       if (!source || !capability) continue;
-      const lxQuality = selectLxQuality(quality, capability.qualities);
-      if (!lxQuality) continue;
-
-      try {
-        const result = await source.runtime.invoke({
-          source: lxPlatform,
-          quality: lxQuality,
-          timeoutMs: Math.min(SOURCE_REQUEST_TIMEOUT_MS, remaining),
-          musicInfo: {
-            id,
-            songmid: id,
-            ...(lxPlatform === 'tx' ? { strMediaMid: id } : {}),
+      const exactQuality = getExactLxQuality(platform, quality, capability.qualities);
+      const candidates = options.allowFallback === false
+        ? (exactQuality ? [exactQuality] : [])
+        : getLxQualityCandidates(quality, capability.qualities, platform);
+      for (const lxQuality of candidates) {
+        const candidateRemaining = deadline - Date.now();
+        if (candidateRemaining <= 0) break;
+        try {
+          const result = await source.runtime.invoke({
             source: lxPlatform,
-            types: capability.qualities.map((type) => ({ type, size: null }))
-          }
-        });
-        return mapLxQualityToTrackUrl(validateAudioUrl(result), lxQuality);
-      } catch (error) {
-        this.log('warn', source.name, config.hash, `获取音频失败: ${safeErrorMessage(error)}`);
+            quality: lxQuality,
+            timeoutMs: Math.min(SOURCE_REQUEST_TIMEOUT_MS, candidateRemaining),
+            musicInfo: {
+              id,
+              songmid: id,
+              ...(lxPlatform === 'tx' ? { strMediaMid: id } : {}),
+              source: lxPlatform,
+              types: capability.qualities.map((type) => ({ type, size: null }))
+            }
+          });
+          return mapLxQualityToTrackUrl(validateAudioUrl(result), lxQuality);
+        } catch (error) {
+          this.log('warn', source.name, config.hash, `获取音频失败: ${safeErrorMessage(error)}`);
+        }
       }
     }
     return undefined;

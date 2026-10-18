@@ -15,7 +15,7 @@ export const LX_SOURCE_ENV_KEYS = [
   'LX_SOURCE_URL9'
 ] as const;
 
-export const LX_QUALITIES = ['128k', '320k', 'flac', 'flac24bit'] as const;
+export const LX_QUALITIES = ['128k', '320k', 'flac', 'flac24bit', 'hires', 'atmos', 'master'] as const;
 
 export type LxQuality = typeof LX_QUALITIES[number];
 export type LxPlatform = 'tx' | 'wy';
@@ -67,7 +67,8 @@ export interface LxTrackUrlResolver {
     platform: MusicPlatform,
     id: string,
     quality?: string,
-    accountSources?: readonly string[]
+    accountSources?: readonly string[],
+    options?: { allowFallback?: boolean }
   ): Promise<TrackUrl | undefined>;
 }
 

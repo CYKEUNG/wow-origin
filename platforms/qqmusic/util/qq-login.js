@@ -3,7 +3,8 @@
 // Protocol reference: https://l-1124.github.io/QQMusicApi/reference/modules/login/
 const { randomUUID } = require('node:crypto');
 const { CookieJar } = require('tough-cookie');
-const { loginFetch, loginCgi, responseSetCookies, cookieHeader, credentialCookies, loginError } = require('./login-http');
+const { loginFetch, responseSetCookies, cookieHeader, credentialCookies, loginError } = require('./login-http');
+const { createAndroidLoginContextFromIdentity, bindAndroidLoginContext } = require('./android-login');
 const REDIRECT_URI = 'https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/';
 const LOGIN_JUMP = 'https://graph.qq.com/oauth2.0/login_jump';
 const PTLOGIN_ORIGIN = 'https://xui.ptlogin2.qq.com';
@@ -59,9 +60,9 @@ async function cookieMap(session, url) {
   return Object.fromEntries((await session.jar.getCookies(url)).map((cookie) => [cookie.key, cookie.value]));
 }
 
-async function startLogin() {
+async function startLogin(identityValue) {
   for (const [token, session] of sessions) if (session.expiresAt <= Date.now()) sessions.delete(token);
-  const session = { jar: new CookieJar(undefined, { looseMode: true }), expiresAt: Date.now() + TTL, pending: null };
+  const session = { jar: new CookieJar(undefined, { looseMode: true }), android: createAndroidLoginContextFromIdentity(identityValue), expiresAt: Date.now() + TTL, pending: null };
   const loginUrl = xloginUrl();
   const loginPage = await sessionFetch(session, loginUrl, {
     headers: { Referer: REFERER, Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/*,*/*;q=0.8' },
@@ -89,6 +90,7 @@ async function startLogin() {
 }
 
 async function authorize(jumpUrl, session) {
+  session.stage = 'check_sig';
   const jump = new URL(jumpUrl);
   if (jump.origin !== 'https://ssl.ptlogin2.graph.qq.com') throw new Error('QQ 扫码响应包含无效的会话校验地址');
   const uin = jump.searchParams.get('uin');
@@ -120,6 +122,7 @@ async function authorize(jumpUrl, session) {
   }
   const ui = randomUUID().toUpperCase();
   await session.jar.setCookie(`ui=${ui}; Path=/; Domain=graph.qq.com`, 'https://graph.qq.com/', { ignoreError: true });
+  session.stage = 'graph_authorize';
   const response = await sessionFetch(session, 'https://graph.qq.com/oauth2.0/authorize', {
     method: 'POST',
     headers: {
@@ -140,12 +143,17 @@ async function authorize(jumpUrl, session) {
   const redirect = location ? new URL(location, 'https://graph.qq.com/') : null;
   const code = redirect?.searchParams.get('code') || new URLSearchParams(redirect?.hash.slice(1)).get('code');
   if (!code) throw new Error(`QQ 授权未返回 code (HTTP ${response.status})`);
-  const result = await loginCgi('QQConnectLogin.LoginServer', 'QQLogin', { code }, { ct: 24, cv: 4747474, platform: 'yqq.json', tmeLoginType: 2 });
+  session.stage = 'android_login';
+  const result = await session.android.androidLoginCgi('QQConnectLogin.LoginServer', 'QQLogin', { code }, {}, { tmeLoginType: 2 });
   if (result.code !== 0) throw loginError(result.code);
-  return { status: 'done', cookie: credentialCookies({ loginType: 2, ...result.data }) };
+  const cookie = credentialCookies({ loginType: 2, ...result.data });
+  if (session.cancelled) throw new Error('登录会话已取消');
+  bindAndroidLoginContext(cookie.musicid, session.android);
+  return { status: 'done', cookie };
 }
 
 async function pollSession(session) {
+  session.stage = 'ptqrlogin';
   const loginCookies = await cookieMap(session, `${PTLOGIN_ORIGIN}/`);
   const url = new URL('/ssl/ptqrlogin', PTLOGIN_ORIGIN);
   url.search = new URLSearchParams({
@@ -181,8 +189,23 @@ async function pollLogin(token) {
     return result;
   } catch (error) {
     sessions.delete(token);
+    // A raw exception can contain the redirect URL or login credentials. Log only
+    // the stage and stack frames so Workers Events can locate the failing call.
+    console.error('[qq-login] QR login failed', {
+      stage: session.stage || 'unknown',
+      name: error?.name || 'Error',
+      code: error?.diagnostics?.code,
+      details: error?.diagnostics?.details,
+      frames: String(error?.stack || '').split('\n').slice(1, 7).join('\n'),
+    });
     return { status: 'error', msg: error.message };
   } finally { session.pending = null; }
 }
 
-module.exports = { startLogin, pollLogin, hash33 };
+function cancelLogin(token) {
+  const session = sessions.get(token);
+  if (session) session.cancelled = true;
+  sessions.delete(token);
+}
+
+module.exports = { cancelLogin, startLogin, pollLogin, hash33 };

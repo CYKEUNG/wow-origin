@@ -11,7 +11,31 @@ describe('NeteaseClient', () => {
     delete global.__musicPlatformFactory__
   })
 
-  test('getTrackUrl 兼容 song_url_v1 实际返回结构', async () => {
+  test('getTrackDetail 合并歌曲音质详情返回新增档位', async () => {
+    const callModule = jest.fn((route) => Promise.resolve(route === 'song/detail'
+      ? { code: 200, songs: [{ id: 123, name: '歌曲', ar: [], al: {}, sq: { size: 100 } }] }
+      : { code: 200, data: { songId: 123, jm: { size: 200 }, je: { size: 300 }, vi: { size: 400 }, sks: [{ it: 'c51', size: 500 }] } }))
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    const track = await new NeteaseClient('MUSIC_U=music-u').getTrackDetail('123')
+
+    expect(track.qualities.map(({ key }) => key)).toEqual(['lossless', 'jyeffect', 'sky', 'master'])
+    expect(callModule.mock.calls.map(([route]) => route)).toEqual(['song/detail', 'song/music/detail'])
+    expect(callModule.mock.calls.map(([, options]) => options.query.MUSIC_U)).toEqual(['music-u', 'music-u'])
+  })
+
+  test('歌曲音质详情请求失败时保留基础详情', async () => {
+    const callModule = jest.fn((route) => route === 'song/detail'
+      ? Promise.resolve({ code: 200, body: { songs: [{ id: 1, name: '歌曲', sq: { size: 100 } }] } })
+      : Promise.reject(new Error('quality details unavailable')))
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    const track = await new NeteaseClient('MUSIC_U=music-u').getTrackDetail('1')
+
+    expect(track.qualities.map(({ key }) => key)).toEqual(['lossless'])
+  })
+
+  test('getTrackUrl 使用 XEAPI 模块并映射实际音质', async () => {
     const callModule = jest.fn((route) => {
       if (route === 'lyric') {
         return Promise.resolve({ code: 200, lrc: { lyric: '逐行歌词' } })
@@ -51,15 +75,93 @@ describe('NeteaseClient', () => {
       bitrate: 1058275,
       size: 42154117
     })
-    expect(callModule).toHaveBeenCalledWith('song/url/v1', expect.objectContaining({
+    expect(callModule).toHaveBeenCalledWith('song/url/xeapi', expect.objectContaining({
       query: expect.objectContaining({
         id: '33418857',
+        level: 'lossless',
         MUSIC_U: 'music-u',
         platform: 'netease'
       })
     }))
     expect(callModule).not.toHaveBeenCalledWith('lyric', expect.anything())
     expect(callModule).not.toHaveBeenCalledWith('lyric/new', expect.anything())
+  })
+
+  test('高音质请求返回其他音质时直接使用该链接和实际音质', async () => {
+    const callModule = jest.fn((_route, { query }) => Promise.resolve({
+      code: 200,
+      body: { data: [{ url: `https://audio.example/${query.level}`, level: 'standard' }] }
+    }))
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    await expect(new NeteaseClient('MUSIC_U=music-u').getTrackUrl('33418857', 'master'))
+      .resolves.toMatchObject({ url: 'https://audio.example/master', quality: 'standard' })
+    expect(callModule.mock.calls.map(([, options]) => options.query.level)).toEqual(['master'])
+  })
+
+  test('官方试听链接视为不可用，按歌曲音质表降级到完整链接', async () => {
+    const callModule = jest.fn(async (route, { query }) => {
+      if (route === 'song/detail') return { code: 200, songs: [{ id: 123, h: { size: 100 }, l: { size: 100 } }] }
+      if (route === 'song/music/detail') return { code: 200, data: {} }
+      return { code: 200, data: [{
+        url: `https://audio.test/${query.level}`,
+        level: query.level,
+        freeTrialInfo: query.level === 'standard' ? null : { start: 0, end: 30 }
+      }] }
+    })
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    await expect(new NeteaseClient('').getTrackUrl('123', 'exhigh')).resolves.toMatchObject({
+      url: 'https://audio.test/standard', quality: 'standard'
+    })
+    expect(callModule.mock.calls.filter(([route]) => route === 'song/url/xeapi').map(([, { query }]) => query.level))
+      .toEqual(['exhigh', 'standard'])
+    expect(callModule.mock.calls.filter(([route]) => route === 'song/detail')).toHaveLength(1)
+  })
+
+  test('所有档位都是试听时不返回试听链接，也不向上选择', async () => {
+    const callModule = jest.fn(async (route, { query }) => {
+      if (route === 'song/detail') return { code: 200, songs: [{ id: 123, jm: { size: 100 }, h: { size: 100 }, l: { size: 100 } }] }
+      if (route === 'song/music/detail') return { code: 200, data: {} }
+      return { code: 200, data: [{
+        url: `https://audio.test/${query.level}`, level: query.level, freeTrialInfo: { start: 0, end: 30 }
+      }] }
+    })
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    await expect(new NeteaseClient('').getTrackUrl('123', 'lossless')).rejects.toThrow('Song only has a trial audio URL')
+    expect(callModule.mock.calls.filter(([route]) => route === 'song/url/xeapi').map(([, { query }]) => query.level))
+      .toEqual(['lossless', 'exhigh', 'standard'])
+    expect(callModule.mock.calls.filter(([route]) => route === 'song/detail')).toHaveLength(1)
+  })
+
+  test.each([undefined, null])('完整链接的 freeTrialInfo 为 %s 时不因试听权限字段误判', async (freeTrialInfo) => {
+    const callModule = jest.fn().mockResolvedValue({ code: 200, data: [{
+      url: 'https://audio.test/full.flac', level: 'lossless', freeTrialInfo,
+      freeTrialPrivilege: { resConsumable: false, userConsumable: false }
+    }] })
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    await expect(new NeteaseClient('').getTrackUrl('123', 'lossless')).resolves.toMatchObject({ url: 'https://audio.test/full.flac' })
+    expect(callModule).toHaveBeenCalledTimes(1)
+  })
+
+  test('高音质、SQ、HQ 均无链接时继续降至标准', async () => {
+    const callModule = jest.fn((route, { query }) => {
+      if (route === 'song/detail') return Promise.resolve({ code: 200, songs: [{ id: 33418857, sq: { size: 100 }, h: { size: 100 }, l: { size: 100 } }] })
+      if (route === 'song/music/detail') return Promise.resolve({ code: 200, data: {} })
+      return Promise.resolve({
+        code: 200,
+        body: { data: [{ url: query.level === 'standard' ? 'https://audio.example/standard' : null, level: query.level }] }
+      })
+    })
+    global.__musicPlatformFactory__.getPlatform.mockReturnValue({ callModule })
+
+    await expect(new NeteaseClient('MUSIC_U=music-u').getTrackUrl('33418857', 'sky'))
+      .resolves.toMatchObject({ url: 'https://audio.example/standard', quality: 'standard' })
+    expect(callModule.mock.calls.filter(([route]) => route === 'song/url/xeapi').map(([, options]) => options.query.level)).toEqual([
+      'sky', 'lossless', 'exhigh', 'standard'
+    ])
   })
 
   test('getTrackLyrics 返回逐行与逐字歌词', async () => {

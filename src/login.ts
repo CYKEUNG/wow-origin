@@ -15,6 +15,8 @@ import { qrCodeDataUrl } from './qr';
 import { preloadSessionFavorites } from './onload';
 import { YTMusicClient } from './clients/YTMusicClient';
 
+const { deviceIdFromIdentity } = require('../platforms/qqmusic/util/android-login');
+
 type ResourcePlatform = 'netease' | 'qqmusic';
 type LoginMode = 'create' | 'update';
 
@@ -89,7 +91,7 @@ async function callLoginModule(
     connection: { remoteAddress: 'login-page' }
   });
   if (!result || result.code !== 200) {
-    throw new UpstreamError(result?.message || '登录接口调用失败');
+    throw new UpstreamError(result?.message || '登录接口调用失败', result?.diagnostics);
   }
   return result;
 }
@@ -130,6 +132,16 @@ function accountData(session: MusicAccountSession, allowAccountLxSources: boolea
     useLuoxue: session.useLuoxue,
     lxSource: allowAccountLxSources ? session.lxSource : []
   };
+}
+
+function existingQqDeviceQuery(session?: MusicAccountSession): Record<string, string> {
+  if (!session) return {};
+  if (!session.deviceId && !session.deviceState) return {};
+  const storedId = deviceIdFromIdentity(session.deviceState);
+  if (!storedId || (session.deviceId && session.deviceId !== storedId)) {
+    throw new BadRequestError('QQ 账号已有 deviceId，但设备状态缺失或不匹配，请修复设备记录');
+  }
+  return { qq_android_identity: session.deviceState! };
 }
 
 function sendLoginPage(_req: Request, res: Response): void {
@@ -238,6 +250,19 @@ export function createLoginRouter({
   const pendingPhones = new Map<string, PendingPhone>();
   const checking = new Set<string>();
   const storage = accountStore ?? workDir;
+  (registry.onDeleted ??= new Set()).add((session) => {
+    for (const pendingMap of [pendingLogins, pendingPhones]) {
+      for (const [token, pending] of pendingMap) {
+        if (pending.apiAccessKey === session.apiAccessKey) {
+          if (pending.platform === 'qq') {
+            require('../platforms/qqmusic/util/qq-login').cancelLogin(token);
+            require('../platforms/qqmusic/util/phone-login').cancelPhoneLogin(token);
+          }
+          pendingMap.delete(token); checking.delete(token);
+        }
+      }
+    }
+  });
 
   function loginTarget(body: any): PendingLogin {
     const mode = normalizeLoginMode(body?.mode);
@@ -268,6 +293,7 @@ export function createLoginRouter({
       result.session.favoriteAlbumsLoaded = false;
     }
     await preloadSessionFavorites(result.session);
+    if (registry.byAccessKey.get(apiAccessKey) !== result.session) throw new BadRequestError('账号已删除');
     onAccountsChanged?.();
     return { status: 'success', mode, ...accountData(result.session, allowAccountLxSources), accountName: result.session.name, message: '登录成功' };
   }
@@ -320,7 +346,10 @@ export function createLoginRouter({
       const { mode, platform, apiAccessKey } = loginTarget(req.body);
       if (platform === 'ytmusic') throw new BadRequestError('YouTube Music 请使用 Cookie 登录');
 
-      const result = await callLoginModule(platformFactory, platform, 'login/qr/key');
+      const existing = mode === 'update' ? registry.byAccessKey.get(apiAccessKey) : undefined;
+      const result = await callLoginModule(platformFactory, platform, 'login/qr/key',
+        platform === 'qq' ? existingQqDeviceQuery(existing) : {});
+      if (mode === 'update') requireAccount(registry, apiAccessKey);
       const qr = getQrPayload(platform, result);
       const qrImage = qr.qrImage || (qr.qrText
         ? qrCodeDataUrl(qr.qrText)
@@ -410,7 +439,12 @@ export function createLoginRouter({
         }
         target = previous;
       }
-      const result = await callLoginModule(platformFactory, target.platform, 'login/phone/send', { phone, countryCode, token });
+      const existing = target.mode === 'update' ? registry.byAccessKey.get(target.apiAccessKey) : undefined;
+      const result = await callLoginModule(platformFactory, target.platform, 'login/phone/send', {
+        phone, countryCode, token,
+        ...(target.platform === 'qq' ? existingQqDeviceQuery(existing) : {})
+      });
+      if (target.mode === 'update') requireAccount(registry, target.apiAccessKey);
       const data = result.body;
       if (!data || !['sent', 'captcha', 'frequency'].includes(data.status)) throw new UpstreamError('验证码发送返回无效状态');
       const sessionToken = String(data.token || token || '').trim();

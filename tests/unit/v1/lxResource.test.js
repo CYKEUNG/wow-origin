@@ -5,12 +5,14 @@ const {
   LxSourceManager,
   LxSourceRuntime,
   getLxSourceCachePath,
+  getLxQualityCandidates,
   loadLxSourceConfigs,
   md5,
   parseLxScriptInfo,
   selectLxQuality,
   millisecondsUntilNextOneAm
 } = require('../../../dist/lx-resource')
+const { getExactLxQuality } = require('../../../dist/lx-resource/quality')
 
 const validScript = `/**
  * @name 测试源
@@ -107,8 +109,25 @@ describe('LX resource', () => {
     }))
     expect(selectLxQuality('higher', ['128k', '320k'])).toBe('320k')
     expect(selectLxQuality('lossless', ['128k', '320k'])).toBe('320k')
+    expect(selectLxQuality('hires', ['128k', '320k', 'flac'])).toBe('flac')
+    expect(selectLxQuality('hires', ['flac', 'hires'])).toBe('hires')
+    expect(selectLxQuality('jyeffect', ['flac', 'hires'])).toBeUndefined()
+    expect(selectLxQuality('sky', ['flac', 'atmos'])).toBe('atmos')
+    expect(selectLxQuality('sky', ['128k', '320k', 'flac24bit'])).toBe('320k')
+    expect(selectLxQuality('master', ['128k', 'flac', 'flac24bit', 'master'])).toBe('master')
+    expect(selectLxQuality('master', ['128k', 'flac', 'flac24bit'])).toBe('flac')
+    expect(getLxQualityCandidates('master', ['master', 'hires', 'flac24bit', 'flac', '320k', '128k']))
+      .toEqual(['master', 'flac', '320k', '128k'])
+    expect(getLxQualityCandidates('hires', ['hires', 'flac24bit', 'flac', '320k', '128k']))
+      .toEqual(['hires', 'flac', '320k', '128k'])
+    expect(getLxQualityCandidates('sky', ['atmos', 'hires', 'flac24bit', 'flac', '320k', '128k']))
+      .toEqual(['atmos', 'flac', '320k', '128k'])
+    expect(getLxQualityCandidates('jyeffect', ['flac', '320k', '128k'])).toEqual([])
     expect(selectLxQuality('standard', ['320k'])).toBeUndefined()
     expect(selectLxQuality('max', ['128k', 'flac24bit'])).toBe('flac24bit')
+    expect(selectLxQuality('max', ['flac', 'hires', 'atmos', 'master'], 'qq')).toBe('master')
+    expect(getExactLxQuality('qq', 'master', ['flac', 'master'])).toBe('master')
+    expect(getExactLxQuality('qq', 'master', ['flac'])).toBeUndefined()
     expect(parseLxScriptInfo(`/*!
       * @name 感叹号文件头
       */`).name).toBe('感叹号文件头')
@@ -198,6 +217,29 @@ describe('LX resource', () => {
       expect(downloadSource).not.toHaveBeenCalled()
     } finally {
       await manager.stop()
+    }
+  })
+
+  test('外层按歌曲详情控制降级时，洛雪只尝试指定档位', async () => {
+    const url = 'https://source.test/exact-quality.js'
+    const hash = md5(url)
+    const cacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'wow-lx-exact-'))
+    const script = validScript.replace('const digest =', "if (info.type === 'flac') throw new Error('SQ unavailable')\n  const digest =")
+    await fs.writeFile(getLxSourceCachePath(cacheDirectory, hash), script)
+    const manager = new LxSourceManager({ configs: [{ url, hash, order: 0 }], cacheDirectory })
+    const options = { allowFallback: false }
+    jest.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      manager.start()
+      await manager.waitForInitialLoad()
+      // SQ 请求失败时不能自行尝试 HQ；缺少 Hi-Res 时也不能自行选择 SQ。
+      await expect(manager.resolveTrackUrl('qq', 'track', 'lossless', [], options)).resolves.toBeUndefined()
+      await expect(manager.resolveTrackUrl('netease', 'track', 'hires', [], options)).resolves.toBeUndefined()
+      await expect(manager.resolveTrackUrl('qq', 'track', 'higher', [], options)).resolves.toBeUndefined()
+      await expect(manager.resolveTrackUrl('qq', 'track', 'exhigh', [], options)).resolves.toMatchObject({ quality: 'exhigh' })
+    } finally {
+      await manager.stop()
+      await fs.rm(cacheDirectory, { recursive: true, force: true })
     }
   })
 

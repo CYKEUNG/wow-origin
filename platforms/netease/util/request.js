@@ -6,6 +6,7 @@ const { URLSearchParams } = require('url')
 const { getAppConf } = require('../config')
 const genCheckToken = require('./checkToken')
 const Logger = require('../../../core/Logger')
+const { createUpstreamError } = require('../../../core/UpstreamDiagnostics')
 
 const logger = new Logger({ component: 'netease-request' })
 
@@ -32,6 +33,13 @@ const DEFAULT_HEADER = {
 }
 const WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0'
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/3.1.19.204510'
+const ANDROID_UA = 'NeteaseMusic/9.5.61.260802021928(9005061);Dalvik/2.1.0 (Linux; U; Android 12; HBN-AL00 Build/cd737a2.0)'
+const XEAPI_DOMAIN = 'https://interface3.music.163.com'
+let xeapiPublicKeyPromise
+let xeapiPublicKeyState
+let xeapiPublicKeyExpiresAt = 0
+let xeapiSessionId = ''
+let xeapiSessionKey = ''
 
 // 创建全局HTTP/HTTPS连接池
 const httpAgent = new http.Agent({
@@ -50,8 +58,104 @@ const httpsAgent = new https.Agent({
 
 logger.compact('info', 'Netease HTTP connection pool initialized (maxSockets: 50, keepAlive: true)', 'debug')
 
+const loadXeapiPublicKey = async (deviceId) => {
+  if (xeapiPublicKeyPromise && Date.now() < xeapiPublicKeyExpiresAt) return xeapiPublicKeyPromise
+  const nonce = Array.from({ length: 16 }, () => Math.floor(Math.random() * 10)).join('')
+  const timestamp = String(Date.now())
+  const data = {
+    appVersion: '9.5.61', currentKeyVersion: xeapiPublicKeyState?.version || '', deviceId, nonce,
+    os: 'android', requestType: 'active',
+    signature: encrypt.xeapiSign(timestamp, nonce),
+    t1: '', t2: '', timestamp, uid: ''
+  }
+  xeapiPublicKeyPromise = axios({
+    method: 'POST',
+    url: `${APP_CONF.apiDomain}/api/bsr/sk/get`,
+    headers: {
+      'User-Agent': ANDROID_UA,
+      Cookie: `deviceId=${encodeURIComponent(deviceId)}`,
+      'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8'
+    },
+    data: new URLSearchParams(data).toString(),
+    httpAgent, httpsAgent
+  }).then(({ data: response }) => {
+    if (response?.code !== 200 || !response.data?.encryptedData) {
+      throw new Error('XEAPI public key request failed')
+    }
+    if (!response.data.signature || encrypt.xeapiSign(response.data.timestamp, nonce) !== response.data.signature) {
+      throw new Error('XEAPI public key signature mismatch')
+    }
+    const key = encrypt.xeapiDecryptPublicKey(response.data.encryptedData)
+    if (!key.sk && xeapiPublicKeyState?.sk) key.sk = xeapiPublicKeyState.sk
+    if (!key.publicKey || !key.sk || !key.version) throw new Error('XEAPI public key incomplete')
+    xeapiPublicKeyState = key
+    return key
+  }).catch(error => {
+    xeapiPublicKeyPromise = undefined
+    throw error
+  })
+  xeapiPublicKeyExpiresAt = Date.now() + 60 * 60 * 1000
+  xeapiSessionId = ''
+  xeapiSessionKey = ''
+  return xeapiPublicKeyPromise
+}
+
+const createXeapiRequest = async (uri, data, options) => {
+  const deviceId = options.deviceId || ''
+  const key = await loadXeapiPublicKey(deviceId)
+  const cookie = {
+    os: 'android', osver: '16', appver: options.appver || '9.1.65',
+    buildver: String(Math.floor(Date.now() / 1000)),
+    deviceId, sDeviceId: deviceId
+  }
+  if (options.MUSIC_U) cookie.MUSIC_U = options.MUSIC_U
+  const headers = {
+    'User-Agent': ANDROID_UA,
+    'X-Client-Enc-State': 'ENCRYPTED',
+    'x-aeapi': 'true',
+    'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+    'x-deviceid': deviceId,
+    'x-sdeviceid': deviceId,
+    'x-os': 'android',
+    'x-osver': '16',
+    'x-appver': cookie.appver,
+    'x-buildver': cookie.buildver,
+    Cookie: Object.entries(cookie).map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`).join('; ')
+  }
+  if (options.MUSIC_U) headers['x-music-u'] = options.MUSIC_U
+  if (options.ip) {
+    headers['X-Real-IP'] = options.ip
+    headers['X-Forwarded-For'] = options.ip
+  }
+  const response = await axios({
+    method: 'POST',
+    url: `${XEAPI_DOMAIN}/xeapi/${uri.substring(5)}`,
+    headers,
+    data: new URLSearchParams(encrypt.xeapi(uri, data, {
+      publicKeyState: key,
+      sessionId: xeapiSessionId,
+      sessionKey: xeapiSessionKey,
+      os: 'android'
+    })).toString(),
+    responseType: 'arraybuffer',
+    httpAgent, httpsAgent
+  })
+  const sessionId = response.headers?.['x-encr-ssid'] || response.headers?.get?.('x-encr-ssid')
+  const sessionKey = response.headers?.['x-encr-sskey'] || response.headers?.get?.('x-encr-sskey')
+  if (sessionId && sessionKey) {
+    xeapiSessionId = sessionId
+    xeapiSessionKey = sessionKey
+  }
+  const body = encrypt.xeapiResDecrypt(toResponseBuffer(response.data))
+  const result = { status: Number(body.code || response.status), body, cookie: {} }
+  if (result.status !== 200) throw result
+  return result
+}
+
 const createRequest = (uri, data, options) => {
+  if (options.crypto === 'xeapi') return createXeapiRequest(uri, data, options)
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
     const dataReq = { ...data }
     const headers = {
       'User-Agent': DEFAULT_UA
@@ -113,6 +217,12 @@ const createRequest = (uri, data, options) => {
         responseType: 'arraybuffer'
       })
     }
+    const context = { platform: 'netease', stage: uri, url, method: 'POST', startedAt }
+    const attachDiagnostics = (error) => {
+      answer.message = error.message
+      Object.defineProperty(answer, 'diagnostics', { value: error.diagnostics })
+      return answer
+    }
 
     //LOG_LEVEL=debug可查看详细请求内容
     logger.debug('NetEase EAPI request data', { dataReq })
@@ -166,17 +276,29 @@ const createRequest = (uri, data, options) => {
             answer.status = 200
           }
         } catch (e) {
+          if (uri.startsWith('/api/login/')) {
+            reject(attachDiagnostics(createUpstreamError('网易云登录返回无效响应', e, {
+              ...context, httpStatus: res.status, code: 'UPSTREAM_INVALID_RESPONSE',
+            })))
+            return
+          }
           answer.body = body
           answer.status = res.status
         }
         logger.debug('NetEase EAPI request Response', answer.body )
         if (answer.status === 200) resolve(answer)
-        else reject(answer)
+        else reject(attachDiagnostics(createUpstreamError(`网易云接口返回错误 (${answer.status})`, null, {
+          ...context, httpStatus: res.status, upstreamCode: answer.status, code: `NETEASE_${answer.status}`,
+        })))
       })
       .catch((err) => {
         answer.status = 502
-        answer.body = { code: 502, msg: err }
-        reject(answer)
+        const httpStatus = Number(err?.response?.status) || undefined
+        const error = createUpstreamError(`网易云请求失败${httpStatus ? ` (HTTP ${httpStatus})` : '，请稍后重试'}`, err, {
+          ...context, httpStatus, ...(httpStatus ? { code: `HTTP_${httpStatus}` } : {}),
+        })
+        answer.body = { code: 502, msg: error.message }
+        reject(attachDiagnostics(error))
       })
   })
 }

@@ -136,6 +136,7 @@ export async function refreshLoginSessions({
       const result = await platform.callModule(LOGIN_REFRESH_ROUTE, {
         query: {
           ...currentCookie,
+          ...(session.deviceState ? { qq_android_identity: session.deviceState } : {}),
           platform: resourcePlatform,
           timestamp: Date.now()
         },
@@ -171,7 +172,8 @@ export async function refreshLoginSessions({
         session.platform,
         refreshedCookie,
         registry,
-        accountStore ?? workDir
+        accountStore ?? workDir,
+        typeof result.androidIdentity === 'string' ? result.androidIdentity : undefined
       );
 
       summary.refreshed += 1;
@@ -212,7 +214,7 @@ export async function ensureQQLoginFresh(
     if (!result || result.code !== 200 || typeof result.expired !== 'boolean') {
       throw new Error(result?.message || 'QQ 登录状态检查失败');
     }
-    if (session.cookie !== checkedCookie) return;
+    if (options.registry.byAccessKey.get(key) !== session || session.cookie !== checkedCookie) return;
 
     if (result.expired) {
       const summary = await refreshLoginSessions({
@@ -223,6 +225,7 @@ export async function ensureQQLoginFresh(
       if (summary.refreshed !== 1) throw new Error('QQ 登录凭证已过期且刷新失败');
     }
 
+    if (options.registry.byAccessKey.get(key) !== session) return;
     qqCheckedCookies.set(key, session.cookie);
     qqNextLoginCheckAt.set(key, Date.now() + QQ_CHECK_INTERVAL_MS);
   })();
@@ -232,7 +235,7 @@ export async function ensureQQLoginFresh(
     await check;
   } catch (error) {
     // 上游暂不可用时保留旧凭证，并限制后续请求的重试频率。
-    if (session.cookie === checkedCookie) {
+    if (options.registry.byAccessKey.get(key) === session && session.cookie === checkedCookie) {
       qqCheckedCookies.set(key, session.cookie);
       qqNextLoginCheckAt.set(key, Date.now() + QQ_CHECK_RETRY_MS);
     }
@@ -292,4 +295,10 @@ export function createLoginRefreshScheduler(options: LoginRefreshOptions): Login
       return refreshLoginSessions({ ...options, platform: 'netease', logger });
     }
   };
+}
+
+export function clearAccountLoginRefresh(apiAccessKey: string): void {
+  qqNextLoginCheckAt.delete(apiAccessKey);
+  qqCheckedCookies.delete(apiAccessKey);
+  qqLoginChecksInFlight.delete(apiAccessKey);
 }
