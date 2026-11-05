@@ -2,9 +2,9 @@
   const $ = (id) => document.getElementById(id);
   const state = {
     adminPassword: '', adminSequence: 0, deleteKey: '',
-    apiBase: '', page: 'home', mode: '', platform: 'qq', token: '', timer: null,
+    apiBase: '', page: 'home', mode: '', platform: 'qq', kugouEdition: 'standard', token: '', timer: null,
     accountQrTimer: null, accountQrSequence: 0, account: null, status: null,
-    method: 'qr', loginSequence: 0, phoneToken: '', phoneRetryAt: 0, phoneTimer: null
+    method: 'qr', qrType: 'qq', loginSequence: 0, phoneToken: '', phoneRetryAt: 0, phoneTimer: null
   };
 
   function isAdmin() { return isTauri() || Boolean(state.adminPassword); }
@@ -108,7 +108,13 @@
     $('login-error').textContent = '';
     updateAccountNavigationActive();
   }
-  function stopPolling() { $('account-config').removeAttribute('inert'); $('account-config').removeAttribute('aria-busy'); if (state.timer) clearTimeout(state.timer); state.timer = null; state.token = ''; state.loginSequence += 1; }
+  function cancelQr(token) { if (token) jsonRequest('/login/api/cancel', 'POST', { token }).catch(() => {}); }
+  function stopPolling() {
+    cancelQr(state.token);
+    $('account-config').removeAttribute('inert'); $('account-config').removeAttribute('aria-busy');
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null; state.token = ''; state.loginSequence += 1;
+  }
   function clearLoginInputs() {
     state.phoneToken = ''; $('phone-code').value = ''; $('login-cookie').value = '';
     clearPhoneCaptcha();
@@ -120,16 +126,23 @@
   function backToChoose() { stopPolling(); clearLoginInputs(); state.mode = ''; state.account = null; showStep('login-choose'); }
   function setPlatform(platform) {
     state.platform = platform;
+    $('kugou-edition-field').classList.toggle('hidden', platform !== 'kugou');
+    $('kugou-edition').value = state.kugouEdition;
+    $('kugou-edition').disabled = state.mode === 'update';
+    $('qq-qr-types').classList.toggle('hidden', platform !== 'qq');
+    document.querySelectorAll('#qq-qr-types button').forEach(button => button.classList.toggle('active', state.method === 'qr' && button.dataset.qrType === state.qrType));
     document.querySelectorAll('#platform-switch button').forEach((button) => button.classList.toggle('active', button.dataset.platform === platform));
-    $('scan-platform-label').textContent = platformLabel(platform);
-    document.querySelectorAll('#login-methods button').forEach((button) => {
+    $('scan-platform-label').textContent = platformLabel(platform) + (platform === 'kugou' ? ` · ${state.kugouEdition === 'lite' ? '概念版' : '标准版'}` : '');
+    document.querySelectorAll('#login-methods button[data-method]').forEach((button) => {
       const method = button.dataset.method;
-      button.classList.toggle('hidden', method === state.method || (platform === 'ytmusic' && method !== 'cookie'));
+      button.classList.toggle('hidden', method === state.method || (method === 'phone' && platform !== 'kugou') || (platform === 'qq' && method === 'qr') || (platform === 'ytmusic' && method !== 'cookie'));
     });
+    $('phone-country').disabled = platform === 'kugou';
+    if (platform === 'kugou') $('phone-country').value = '86';
     $('account-luoxue').disabled = platform === 'ytmusic';
     $('ytmusic-cookie-help').classList.toggle('hidden', platform !== 'ytmusic');
   }
-  function platformLabel(platform) { return platform === 'qq' ? 'QQ 音乐' : platform === 'ytmusic' ? 'YouTube Music' : '网易云音乐'; }
+  function platformLabel(platform) { return platform === 'kugou' ? '酷狗音乐' : platform === 'qq' ? 'QQ 音乐' : platform === 'ytmusic' ? 'YouTube Music' : '网易云音乐'; }
   function showError(error) { $('login-error').textContent = error.message || String(error); }
 
   async function verifyAccount() {
@@ -143,19 +156,25 @@
   async function startScan() {
     prepareLogin('qr');
     const sequence = state.loginSequence;
+    $('login-qr').classList.remove('qr-invalid'); $('qr-retry').classList.add('hidden');
     $('login-qr').removeAttribute('src'); $('qr-placeholder').classList.remove('hidden');
     $('scan-message').textContent = '正在生成二维码…';
     $('platform-switch').classList.toggle('locked', state.mode === 'update'); setPlatform(state.platform);
     try {
-      const body = { mode: state.mode, platform: state.platform };
+      const body = loginBody();
+      if (state.platform === 'qq') body.qrType = state.qrType;
       if (state.mode === 'update') body.api_access_key = state.account.apiAccessKey;
       const data = await jsonRequest('/login/api/start', 'POST', body);
-      if (sequence !== state.loginSequence) return;
+      if (sequence !== state.loginSequence) { cancelQr(data.token); return; }
       state.token = data.token; state.platform = data.platform; setPlatform(data.platform);
       $('login-qr').src = data.qrImage; $('qr-placeholder').classList.add('hidden');
-      $('scan-message').textContent = data.platform === 'qq' ? '请使用手机 QQ 扫码' : '请使用网易云音乐扫码';
+      $('scan-message').textContent = data.platform === 'qq' ? ({ qq: '请使用手机 QQ 扫码', wx: '请使用微信扫码', mobile: '请使用 QQ 音乐扫码' })[state.qrType] : data.platform === 'kugou' ? `请使用${state.kugouEdition === 'lite' ? '酷狗概念版' : '酷狗音乐标准版'}扫码` : '请使用网易云音乐扫码';
       state.timer = setTimeout(checkLogin, 1500);
     } catch (error) { if (sequence === state.loginSequence) { $('scan-message').textContent = '二维码生成失败'; showError(error); } }
+  }
+  function invalidateQr() {
+    $('login-qr').classList.add('qr-invalid');
+    $('qr-retry').classList.remove('hidden');
   }
   async function checkLogin() {
     if (!state.token) return;
@@ -164,14 +183,15 @@
       const data = await jsonRequest('/login/api/check', 'POST', { token: state.token });
       if (sequence !== state.loginSequence) return;
       $('scan-message').textContent = data.message;
+      if (['success', 'expired', 'error'].includes(data.status)) state.token = '';
       if (data.status === 'success') { stopPolling(); showAccount(data); }
-      else if (data.status === 'expired' || data.status === 'error') stopPolling();
+      else if (data.status === 'expired' || data.status === 'error') { stopPolling(); invalidateQr(); }
       else state.timer = setTimeout(checkLogin, 1500);
-    } catch (error) { if (sequence === state.loginSequence) { stopPolling(); showError(error); } }
+    } catch (error) { if (sequence === state.loginSequence) { stopPolling(); invalidateQr(); showError(error); } }
   }
 
   function loginBody() {
-    return { mode: state.mode, platform: state.platform, ...(state.mode === 'update' ? { api_access_key: state.account.apiAccessKey } : {}) };
+    return { mode: state.mode, platform: state.platform, ...(state.platform === 'kugou' ? { kugouEdition: state.kugouEdition } : {}), ...(state.mode === 'update' ? { api_access_key: state.account.apiAccessKey } : {}) };
   }
   function prepareLogin(method) {
     stopPolling();
@@ -243,11 +263,11 @@
   }
 
   function showAccount(account) {
-    stopPolling(); state.account = account; state.mode = 'update'; state.platform = account.platform;
+    stopPolling(); state.account = account; state.mode = 'update'; state.platform = account.platform; state.kugouEdition = account.kugouEdition || 'standard';
     clearLoginInputs();
     setPlatform(account.platform);
     $('delete-account').classList.remove('hidden');
-    $('account-platform').textContent = platformLabel(account.platform);
+    $('account-platform').textContent = platformLabel(account.platform) + (account.platform === 'kugou' ? ` · ${state.kugouEdition === 'lite' ? '概念版' : '标准版'}` : '');
     $('account-key').textContent = account.apiAccessKey; $('account-name').value = account.name || account.accountName || '';
     $('account-stateless').checked = Boolean(account.stateless); $('account-luoxue').checked = account.useLuoxue !== false;
     applyRuntimeCapabilities();
@@ -334,7 +354,7 @@
     accounts.forEach((account) => {
       const button = document.createElement('button'); button.type = 'button'; button.className = 'account-nav-item';
       button.dataset.accountKey = account.apiAccessKey; button.textContent = account.name;
-      button.title = `${account.name} · ${platformLabel(account.platform)}`;
+      button.title = `${account.name} · ${platformLabel(account.platform)}${account.platform === 'kugou' ? ` · ${account.kugouEdition === 'lite' ? '概念版' : '标准版'}` : ''}`;
       button.addEventListener('click', () => openDesktopAccount(account.apiAccessKey)); list.append(button);
     });
     updateAccountNavigationActive();
@@ -487,18 +507,28 @@
   $('copy-host').addEventListener('click', () => copyText($('host-value').textContent, $('copy-host')));
   $('copy-key').addEventListener('click', () => copyText($('account-key').textContent, $('copy-key')));
   $('account-name').addEventListener('input', scheduleAccountQr);
-  $('choose-create').addEventListener('click', () => { state.mode = 'create'; state.platform = 'qq'; state.account = null; startScan(); });
+  $('choose-create').addEventListener('click', () => { state.mode = 'create'; state.platform = 'qq'; state.kugouEdition = 'standard'; state.account = null; startScan(); });
   $('choose-update').addEventListener('click', () => showStep('login-verify'));
   document.querySelectorAll('.back-choose').forEach((button) => button.addEventListener('click', backToChoose));
   $('verify-submit').addEventListener('click', verifyAccount); $('verify-key').addEventListener('keydown', (event) => { if (event.key === 'Enter') verifyAccount(); });
   document.querySelectorAll('#platform-switch button').forEach((button) => button.addEventListener('click', () => { if (state.mode !== 'update' && state.platform !== button.dataset.platform) { setPlatform(button.dataset.platform); selectLoginMethod(state.method); } }));
-  document.querySelectorAll('#login-methods button').forEach((button) => button.addEventListener('click', () => selectLoginMethod(button.dataset.method)));
+  document.querySelectorAll('#login-methods button[data-method]').forEach((button) => button.addEventListener('click', () => selectLoginMethod(button.dataset.method)));
+  document.querySelectorAll('#qq-qr-types button').forEach(button => button.addEventListener('click', () => {
+    if (state.method !== 'qr' || state.qrType !== button.dataset.qrType) { state.qrType = button.dataset.qrType; startScan(); }
+  }));
   $('phone-send').addEventListener('click', sendPhoneCode);
   for (const id of ['phone-number', 'phone-country']) $(id).addEventListener('input', () => { state.phoneToken = ''; state.loginSequence += 1; clearPhoneCaptcha(); });
   $('phone-login-panel').addEventListener('submit', (event) => { event.preventDefault(); submitManualLogin('phone'); });
+  $('kugou-edition').addEventListener('change', () => {
+    if (state.mode === 'update') return;
+    state.kugouEdition = $('kugou-edition').value;
+    clearLoginInputs();
+    selectLoginMethod(state.method);
+  });
   $('cookie-login-panel').addEventListener('submit', (event) => { event.preventDefault(); submitManualLogin('cookie'); });
   $('scan-back').addEventListener('click', () => state.account ? showAccount(state.account) : backToChoose());
   $('regenerate-qr').addEventListener('click', startScan);
+  $('qr-retry').addEventListener('click', startScan);
   $('relogin').addEventListener('click', () => selectLoginMethod(state.account?.platform === 'ytmusic' ? 'cookie' : 'qr'));
   $('refresh-auth').addEventListener('click', refreshAuthorization);
   $('add-lx-source').addEventListener('click', () => addSourceInput()); $('save-config').addEventListener('click', saveConfig);
